@@ -12,6 +12,17 @@ import {
   ArrowRightLeft, FileDown, Calendar, Home
 } from 'lucide-react';
 
+// --- CONFIGURACIÓN DE FIREBASE (YA INCRUSTADA) ---
+const firebaseConfig = {
+  apiKey: "AIzaSyDpYFlx8gAiV1peCmT2XjHxhkfwi9YQUu8",
+  authDomain: "cuchareli.firebaseapp.com",
+  projectId: "cuchareli",
+  storageBucket: "cuchareli.firebasestorage.app",
+  messagingSenderId: "1085898940488",
+  appId: "1:1085898940488:web:1e1b23dda539237a13f87d",
+  measurementId: "G-Q1YTR3RBH1"
+};
+
 // --- ESTILO Y MARCA ---
 const BRAND = {
   brown: 'bg-[#5D4037]',
@@ -36,8 +47,7 @@ export default function CucharelliApp() {
   const [products, setProducts] = useState(initialProducts);
   const [transactions, setTransactions] = useState([]);
   
-  // Firebase
-  const [firebaseConfigInput, setFirebaseConfigInput] = useState('');
+  // Firebase States
   const [isFirebaseReady, setIsFirebaseReady] = useState(false);
   const [appId] = useState('cucharelli-v2');
   const [db, setDb] = useState(null);
@@ -65,56 +75,43 @@ export default function CucharelliApp() {
   const [editTransAmount, setEditTransAmount] = useState('');
   const [editTransDesc, setEditTransDesc] = useState('');
 
-  // --- LOGICA FIREBASE ---
+  // --- LOGICA FIREBASE AUTOMÁTICA ---
   useEffect(() => {
-    const savedConfig = localStorage.getItem('cucharelli_firebase_config');
+    // 1. Cargar nombre de empresa si existe
     const savedName = localStorage.getItem('cucharelli_company_name');
     if (savedName) setCompanyName(savedName);
 
-    if (savedConfig) {
-      try {
-        const config = JSON.parse(savedConfig);
-        setFirebaseConfigInput(savedConfig);
-        initFirebase(config);
-      } catch (e) {
-        console.error("Config inválida", e);
-      }
-    }
+    // 2. Iniciar Firebase Automáticamente con la config incrustada
+    initFirebase(firebaseConfig);
   }, []);
 
   const initFirebase = async (config) => {
     try {
       let app;
-      try { app = initializeApp(config); } catch(e) { return; }
+      try { 
+        app = initializeApp(config); 
+      } catch(e) { 
+        // Si ya existe una instancia, no hacemos nada (es normal en hot-reload)
+        return; 
+      }
+      
       const authInstance = getAuth(app);
       const dbInstance = getFirestore(app);
       setAuth(authInstance);
       setDb(dbInstance);
       
-      try { await signInAnonymously(authInstance); } catch (e) {
+      try { 
+        await signInAnonymously(authInstance); 
+      } catch (e) {
         if (e.code === 'auth/configuration-not-found') alert("⚠️ Activa 'Anónimo' en Firebase Auth.");
       }
 
       onAuthStateChanged(authInstance, (u) => {
         if (u) { setUser(u); setIsFirebaseReady(true); }
       });
-    } catch (error) { alert("Error conexión: " + error.message); }
-  };
-
-  const handleSaveConfig = () => {
-    try {
-      let config;
-      try { config = JSON.parse(firebaseConfigInput); } catch (e) {
-        const fixedInput = firebaseConfigInput.trim().replace(/^const\s+\w+\s*=\s*/, '').replace(/;$/, '');
-        config = new Function("return " + fixedInput)();
-      }
-      if (!config || !config.apiKey) throw new Error("Incompleta");
-      const cleanJson = JSON.stringify(config);
-      localStorage.setItem('cucharelli_firebase_config', cleanJson);
-      setFirebaseConfigInput(cleanJson);
-      initFirebase(config);
-      alert("Guardado. Conectando...");
-    } catch (e) { alert("Configuración inválida."); }
+    } catch (error) { 
+      console.error("Error conexión Firebase:", error);
+    }
   };
 
   useEffect(() => {
@@ -258,9 +255,6 @@ export default function CucharelliApp() {
     const validRows = saleRows.filter(r => r.prodId && r.qty > 0 && r.price);
     if (validRows.length === 0) return alert("Añade productos válidos");
 
-    // Determinar de dónde descontar (por ahora asumimos venta desde Vitrina Principal)
-    // Si quisieras vender desde Daniela, habría que agregar un selector de ubicación en la venta.
-    // Por simplicidad, asumimos Vitrina Principal.
     for (let row of validRows) {
       const prod = products.find(p => p.id === row.prodId);
       if (!prod || prod.stock < row.qty) return alert(`¡Stock insuficiente de ${prod?.name || 'producto'}!`);
@@ -309,7 +303,6 @@ export default function CucharelliApp() {
   const startEditingTransaction = (t) => {
     setEditingTransId(t.id);
     setEditTransAmount(t.amount || 0);
-    // Para gastos/ventas simples, usamos la descripción o el primer item
     setEditTransDesc(t.description || (t.items && t.items[0]?.name) || 'Movimiento');
   };
 
@@ -317,11 +310,8 @@ export default function CucharelliApp() {
     if (!editingTransId) return;
     if (isFirebaseReady && db) {
       const ref = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', editingTransId);
-      // Solo actualizamos el monto y la descripción si es un gasto simple
-      // No modificamos el stock retrospectivamente para evitar caos, solo el valor contable
       await updateDoc(ref, { 
         amount: parseFloat(editTransAmount),
-        // Si es gasto, permitimos cambiar descripción
         ...(editTransDesc ? { description: editTransDesc } : {})
       });
       alert("Registro corregido");
@@ -649,17 +639,14 @@ export default function CucharelliApp() {
                 ))}
               </div>
             </div>
-            {/* CONEXION */}
-            <div className="bg-[#E3F2FD] p-5 rounded-2xl border border-blue-100">
-              <h3 className="font-bold text-blue-900 mb-2">Conexión</h3>
-              {!isFirebaseReady ? (
-                <>
-                  <textarea className="w-full p-2 bg-white rounded-xl text-[10px] font-mono h-20 mb-2 border border-blue-200" placeholder='{"apiKey": "...", ...}' value={firebaseConfigInput} onChange={(e) => setFirebaseConfigInput(e.target.value)}/>
-                  <button onClick={handleSaveConfig} className="bg-blue-600 text-white w-full py-2 rounded-lg font-bold text-xs">Conectar</button>
-                </>
-              ) : (
-                <div className="text-center"><span className="inline-flex items-center gap-1 text-green-700 bg-green-100 px-3 py-1 rounded-full text-xs font-bold">● Conectado</span></div>
-              )}
+            {/* CONEXION (MODIFICADO: Solo indicador de estado) */}
+            <div className="bg-[#E3F2FD] p-5 rounded-2xl border border-blue-100 text-center">
+               <p className="text-sm text-gray-500 mb-2">Base de datos configurada internamente.</p>
+               {!isFirebaseReady ? (
+                  <span className="text-orange-500 font-bold text-xs">Conectando a Cucharelli...</span>
+               ) : (
+                  <span className="inline-flex items-center gap-1 text-green-700 bg-green-100 px-3 py-1 rounded-full text-xs font-bold">● Conectado a Cucharelli</span>
+               )}
             </div>
           </div>
         );
