@@ -2,14 +2,15 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getFirestore, collection, addDoc, onSnapshot, 
-  query, orderBy, doc, updateDoc, deleteDoc, serverTimestamp, increment, writeBatch 
+  query, orderBy, doc, updateDoc, deleteDoc, serverTimestamp, increment, writeBatch, getDocs 
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { 
   Package, ShoppingCart, TrendingUp, DollarSign, 
   Settings, PlusCircle, Trash2, Save, Activity, LayoutGrid,
   Image as ImageIcon, Plus, X, Pencil, RotateCcw,
-  ArrowRightLeft, FileDown, Calendar, Home, StickyNote
+  ArrowRightLeft, FileDown, Calendar, Home, StickyNote,
+  MapPin, AlertTriangle, ArrowRight, ArrowLeft
 } from 'lucide-react';
 
 // --- CONFIGURACIÓN DE FIREBASE ---
@@ -56,8 +57,13 @@ export default function CucharelliApp() {
 
   // Estados de Interfaz
   const [companyName, setCompanyName] = useState('Cucharelli');
-  const [stockViewMode, setStockViewMode] = useState('main'); // 'main' | 'daniela'
-  const [reportFilter, setReportFilter] = useState('month'); 
+  const [stockViewMode, setStockViewMode] = useState('main'); 
+  const [reportFilter, setReportFilter] = useState('month'); // 'all', 'month', o ID de evento
+  const [transferDirection, setTransferDirection] = useState('to_daniela'); // 'to_daniela' o 'from_daniela'
+
+  // Estados de Eventos (Feria)
+  const [activeEvent, setActiveEvent] = useState(''); // Nombre del evento activo (ej: 'Feria Barranco')
+  const [tempEventName, setTempEventName] = useState(''); // Input para crear evento
 
   // Formularios
   const [newProdName, setNewProdName] = useState('');
@@ -68,8 +74,8 @@ export default function CucharelliApp() {
 
   // Ventas y Gastos
   const [saleRows, setSaleRows] = useState([{ id: Date.now(), prodId: '', qty: 1, price: '' }]);
-  const [saleLocation, setSaleLocation] = useState('main'); // 'main' (Vitrina) | 'daniela' (Casa Daniela)
-  const [saleNote, setSaleNote] = useState(''); // Nueva nota de venta
+  const [saleLocation, setSaleLocation] = useState('main'); 
+  const [saleNote, setSaleNote] = useState(''); 
   const [expenseRows, setExpenseRows] = useState([{ id: Date.now(), desc: '', amount: '' }]);
 
   // Edición de Reportes
@@ -81,6 +87,11 @@ export default function CucharelliApp() {
   useEffect(() => {
     const savedName = localStorage.getItem('cucharelli_company_name');
     if (savedName) setCompanyName(savedName);
+    
+    // Cargar evento activo si existe
+    const savedEvent = localStorage.getItem('cucharelli_active_event');
+    if (savedEvent) setActiveEvent(savedEvent);
+
     initFirebase(firebaseConfig);
   }, []);
 
@@ -156,34 +167,55 @@ export default function CucharelliApp() {
         batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), { stock: increment(parseInt(qty)) });
       });
       batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions')), {
-        type: 'restock', location: 'main', items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), createdAt: serverTimestamp()
+        type: 'restock', location: 'main', items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), createdAt: serverTimestamp(),
+        eventName: activeEvent || null
       });
       await batch.commit();
     }
     setStockInputs({}); alert("Producción registrada");
   };
 
-  const transferToDaniela = async () => {
+  // NUEVO: TRANSFERENCIA BIDIRECCIONAL
+  const handleTransfer = async () => {
     const updates = Object.entries(transferInputs).filter(([_, qty]) => parseInt(qty) > 0);
     if (updates.length === 0) return;
+
+    // Validar Stock según dirección
     for (let [id, qty] of updates) {
       const prod = products.find(p => p.id === id);
-      if (prod.stock < parseInt(qty)) return alert(`Falta stock de ${prod.name} en vitrina.`);
+      if (transferDirection === 'to_daniela' && prod.stock < parseInt(qty)) return alert(`Falta stock de ${prod.name} en Vitrina.`);
+      if (transferDirection === 'from_daniela' && prod.stockDaniela < parseInt(qty)) return alert(`Falta stock de ${prod.name} en Casa Daniela.`);
     }
+
     if (isFirebaseReady && db) {
       const batch = writeBatch(db);
       updates.forEach(([id, qty]) => {
-        batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), { stock: increment(-parseInt(qty)), stockDaniela: increment(parseInt(qty)) });
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'products', id);
+        if (transferDirection === 'to_daniela') {
+          // Vitrina -> Daniela
+          batch.update(ref, { stock: increment(-parseInt(qty)), stockDaniela: increment(parseInt(qty)) });
+        } else {
+          // Daniela -> Vitrina (Regreso)
+          batch.update(ref, { stock: increment(parseInt(qty)), stockDaniela: increment(-parseInt(qty)) });
+        }
       });
+      
+      const desc = transferDirection === 'to_daniela' ? 'Envío a Daniela' : 'Retorno de Daniela';
+      
       batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions')), {
-        type: 'transfer', description: 'Envío a Daniela', amount: 0, items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), createdAt: serverTimestamp()
+        type: 'transfer', 
+        description: desc, 
+        amount: 0, 
+        items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), 
+        createdAt: serverTimestamp(),
+        eventName: activeEvent || null
       });
       await batch.commit();
     }
-    setTransferInputs({}); alert("Enviado a Daniela");
+    setTransferInputs({}); alert("Transferencia exitosa");
   };
 
-  // --- VENTAS (ACTUALIZADO V4) ---
+  // --- VENTAS ---
   const addSaleRow = () => setSaleRows([...saleRows, { id: Date.now(), prodId: '', qty: 1, price: '' }]);
   const removeSaleRow = (id) => setSaleRows(saleRows.filter(row => row.id !== id));
   const updateSaleRow = (id, field, value) => setSaleRows(saleRows.map(row => row.id === id ? { ...row, [field]: value } : row));
@@ -193,7 +225,6 @@ export default function CucharelliApp() {
     const validRows = saleRows.filter(r => r.prodId && r.qty > 0 && r.price);
     if (validRows.length === 0) return alert("Añade productos válidos");
 
-    // Verificar Stock según Ubicación
     for (let row of validRows) {
       const prod = products.find(p => p.id === row.prodId);
       const stockAvailable = saleLocation === 'main' ? prod.stock : prod.stockDaniela;
@@ -206,7 +237,6 @@ export default function CucharelliApp() {
       const batch = writeBatch(db);
       validRows.forEach(row => {
         const ref = doc(db, 'artifacts', appId, 'public', 'data', 'products', row.prodId);
-        // Descontar del lugar correcto
         if (saleLocation === 'main') {
           batch.update(ref, { stock: increment(-parseInt(row.qty)) });
         } else {
@@ -216,33 +246,52 @@ export default function CucharelliApp() {
       
       batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions')), {
         type: 'sale', 
-        location: saleLocation, // Guardamos dónde fue
+        location: saleLocation, 
         amount: totalSaleAmount,
-        description: saleNote || (saleLocation === 'main' ? 'Venta Vitrina' : 'Venta Daniela'), // Guardamos la nota
+        description: saleNote || (saleLocation === 'main' ? 'Venta Vitrina' : 'Venta Daniela'), 
         items: validRows.map(row => ({
           name: products.find(p => p.id === row.prodId)?.name,
           qty: parseInt(row.qty),
           lineTotal: parseFloat(row.price)
         })),
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        eventName: activeEvent || null // GUARDAMOS EL EVENTO ACTIVO
       });
       await batch.commit();
     }
     setSaleRows([{ id: Date.now(), prodId: '', qty: 1, price: '' }]);
-    setSaleNote(''); // Limpiar nota
+    setSaleNote(''); 
     alert("¡Venta Registrada!");
   };
 
-  // --- GASTOS Y REPORTES ---
+  // --- GASTOS ---
   const addExpenseRow = () => setExpenseRows([...expenseRows, { id: Date.now(), desc: '', amount: '' }]);
   const registerMultiExpense = async () => {
     const validRows = expenseRows.filter(r => r.desc && r.amount);
     if (validRows.length === 0) return alert("Datos incompletos");
     const total = validRows.reduce((acc, r) => acc + parseFloat(r.amount), 0);
     if (isFirebaseReady && db) await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'), {
-      type: 'expense', amount: total, items: validRows.map(r => ({ desc: r.desc, price: parseFloat(r.amount) })), createdAt: serverTimestamp()
+      type: 'expense', amount: total, 
+      items: validRows.map(r => ({ desc: r.desc, price: parseFloat(r.amount) })), 
+      createdAt: serverTimestamp(),
+      eventName: activeEvent || null // GUARDAMOS EL EVENTO
     });
     setExpenseRows([{ id: Date.now(), desc: '', amount: '' }]); alert("Gastos registrados");
+  };
+
+  // --- GESTIÓN DE EVENTOS Y REPORTES ---
+  const activateEvent = () => {
+    if(!tempEventName) return alert("Escribe un nombre para el evento (ej: Feria Julio)");
+    setActiveEvent(tempEventName);
+    localStorage.setItem('cucharelli_active_event', tempEventName);
+    setTempEventName('');
+    alert(`Modo Evento activado: ${tempEventName}. Ahora las ventas se guardarán con este nombre.`);
+  };
+
+  const deactivateEvent = () => {
+    setActiveEvent('');
+    localStorage.removeItem('cucharelli_active_event');
+    alert("Modo Evento desactivado. Volviendo a ventas normales.");
   };
 
   const saveTransactionEdit = async () => {
@@ -259,18 +308,59 @@ export default function CucharelliApp() {
     if (window.confirm("¿Borrar?")) if (isFirebaseReady && db) await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'transactions', id));
   };
 
-  const exportToCSV = () => {
-    const rows = filteredTransactions.map(t => `${t.createdAt.toLocaleDateString()},${t.type},"${t.description || ''}",${t.amount || 0}`);
-    const link = document.createElement("a");
-    link.href = "data:text/csv;charset=utf-8," + encodeURI("Fecha,Tipo,Desc,Monto\n" + rows.join("\n"));
-    link.download = "reporte.csv"; document.body.appendChild(link); link.click();
+  // NUEVO: BORRADO TOTAL
+  const clearAllHistory = async () => {
+    const confirm1 = window.confirm("⚠️ ¿ESTÁS SEGURO?\n\nEsto borrará TODO el historial de ventas y gastos de los reportes. Tu stock y productos NO se borrarán.");
+    if (!confirm1) return;
+    const confirm2 = window.confirm("⚠️ CONFIRMACIÓN FINAL\n\n¿Realmente quieres dejar los reportes en CERO? No se puede deshacer.");
+    if (!confirm2) return;
+
+    if (isFirebaseReady && db) {
+      const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'));
+      const snapshot = await getDocs(q);
+      const batch = writeBatch(db);
+      snapshot.docs.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+      await batch.commit();
+      alert("Historial borrado exitosamente. Inicio limpio.");
+    }
   };
+
+  const exportToCSV = () => {
+    const rows = filteredTransactions.map(t => `${t.createdAt.toLocaleDateString()},${t.type},"${t.description || ''}",${t.amount || 0},${t.eventName || 'Normal'}`);
+    const link = document.createElement("a");
+    link.href = "data:text/csv;charset=utf-8," + encodeURI("Fecha,Tipo,Desc,Monto,Evento\n" + rows.join("\n"));
+    link.download = `reporte_${reportFilter}.csv`; document.body.appendChild(link); link.click();
+  };
+
+  // Obtener lista de eventos únicos para el filtro
+  const uniqueEvents = useMemo(() => {
+    const events = new Set();
+    transactions.forEach(t => { if(t.eventName) events.add(t.eventName); });
+    return Array.from(events);
+  }, [transactions]);
 
   const filteredTransactions = useMemo(() => {
     if (reportFilter === 'all') return transactions;
+    
+    // Si el filtro coincide con un nombre de evento, filtramos por evento
+    if (uniqueEvents.includes(reportFilter)) {
+      return transactions.filter(t => t.eventName === reportFilter);
+    }
+
+    // Filtros de fecha normales
     const now = new Date();
-    return transactions.filter(t => t.createdAt.getMonth() === now.getMonth() && t.createdAt.getFullYear() === now.getFullYear());
-  }, [transactions, reportFilter]);
+    return transactions.filter(t => {
+      // Si filtramos por mes/hoy, excluimos los de ferias si se quiere (opcional), 
+      // pero normalmente "Mes" incluye todo. Aqui filtramos por fecha.
+      return t.createdAt.getMonth() === now.getMonth() && t.createdAt.getFullYear() === now.getFullYear();
+    });
+  }, [transactions, reportFilter, uniqueEvents]);
+
+  // Totales
+  const totalSales = filteredTransactions.filter(t => t.type === 'sale').reduce((acc, t) => acc + (t.amount || 0), 0);
+  const totalExpenses = filteredTransactions.filter(t => t.type === 'expense').reduce((acc, t) => acc + (t.amount || 0), 0);
 
   // Totales de Stock
   const totalStockMain = products.reduce((acc, p) => acc + (p.stock || 0), 0);
@@ -283,7 +373,10 @@ export default function CucharelliApp() {
         <h1 className="text-xl font-bold tracking-wider font-serif">{companyName}</h1>
         <span className="text-[10px] text-pink-200 tracking-widest uppercase">By Araceli Palomino</span>
       </div>
-      <span className={`${BRAND.pinkBg} text-white text-xs font-bold px-3 py-1 rounded-full shadow-sm`}>{title}</span>
+      <div className="flex flex-col items-end">
+        <span className={`${BRAND.pinkBg} text-white text-xs font-bold px-3 py-1 rounded-full shadow-sm`}>{title}</span>
+        {activeEvent && <span className="text-[9px] bg-yellow-400 text-brown-900 px-2 py-0.5 rounded mt-1 font-bold animate-pulse">Mode: {activeEvent}</span>}
+      </div>
     </div>
   );
 
@@ -298,32 +391,18 @@ export default function CucharelliApp() {
       case 'stock':
         return (
           <div className="p-4 space-y-4 pb-20">
-            {/* 3. CONTADOR TOTAL (OJO DE ÁGUILA) */}
             <div className="bg-white p-4 rounded-xl shadow-sm border border-[#EFEBE9] grid grid-cols-3 gap-2 text-center">
-              <div className="border-r border-gray-100">
-                <p className="text-[10px] text-gray-400 uppercase font-bold">Total Global</p>
-                <p className={`text-2xl font-bold ${BRAND.brownText}`}>{totalStockMain + totalStockDaniela}</p>
-              </div>
-              <div className="border-r border-gray-100">
-                <p className="text-[10px] text-gray-400 uppercase font-bold">Vitrina</p>
-                <p className="text-xl font-bold text-[#5D4037]">{totalStockMain}</p>
-              </div>
-              <div>
-                <p className="text-[10px] text-gray-400 uppercase font-bold">Daniela</p>
-                <p className="text-xl font-bold text-[#E91E63]">{totalStockDaniela}</p>
-              </div>
+              <div className="border-r border-gray-100"><p className="text-[10px] text-gray-400 uppercase font-bold">Total Global</p><p className={`text-2xl font-bold ${BRAND.brownText}`}>{totalStockMain + totalStockDaniela}</p></div>
+              <div className="border-r border-gray-100"><p className="text-[10px] text-gray-400 uppercase font-bold">Vitrina</p><p className="text-xl font-bold text-[#5D4037]">{totalStockMain}</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase font-bold">Daniela</p><p className="text-xl font-bold text-[#E91E63]">{totalStockDaniela}</p></div>
             </div>
-
             <div className="flex justify-between items-center mb-2">
-              <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}>
-                <Package className="text-[#E91E63]" /> {stockViewMode === 'main' ? 'Tu Vitrina' : 'Casa Daniela'}
-              </h2>
+              <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}><Package className="text-[#E91E63]" /> {stockViewMode === 'main' ? 'Tu Vitrina' : 'Casa Daniela'}</h2>
               <div className="bg-gray-100 p-1 rounded-lg flex text-xs font-bold">
                 <button onClick={() => setStockViewMode('main')} className={`px-3 py-1 rounded-md transition-all ${stockViewMode === 'main' ? 'bg-white shadow text-[#5D4037]' : 'text-gray-400'}`}>Vitrina</button>
                 <button onClick={() => setStockViewMode('daniela')} className={`px-3 py-1 rounded-md transition-all ${stockViewMode === 'daniela' ? 'bg-white shadow text-[#E91E63]' : 'text-gray-400'}`}>Daniela</button>
               </div>
             </div>
-
             <div className="grid grid-cols-2 gap-4">
               {products.map(p => {
                 const currentStock = stockViewMode === 'main' ? p.stock : p.stockDaniela;
@@ -333,15 +412,11 @@ export default function CucharelliApp() {
                       {p.photo ? <img src={p.photo} alt={p.name} className="w-full h-full object-cover" /> : <Package className="text-gray-300" size={40} />}
                       <div className={`absolute top-2 right-2 px-2 py-0.5 rounded-full text-xs font-bold shadow ${stockViewMode === 'main' ? 'bg-white text-[#5D4037]' : 'bg-[#E91E63] text-white'}`}>x{currentStock}</div>
                     </div>
-                    <div className="p-3 text-center bg-white">
-                      <h3 className="font-bold text-[#5D4037] text-sm leading-tight">{p.name}</h3>
-                      <p className={`text-xs mt-1 font-medium ${currentStock < 5 ? 'text-red-500' : 'text-green-600'}`}>{currentStock === 0 ? 'AGOTADO' : 'Disponible'}</p>
-                    </div>
+                    <div className="p-3 text-center bg-white"><h3 className="font-bold text-[#5D4037] text-sm leading-tight">{p.name}</h3><p className={`text-xs mt-1 font-medium ${currentStock < 5 ? 'text-red-500' : 'text-green-600'}`}>{currentStock === 0 ? 'AGOTADO' : 'Disponible'}</p></div>
                   </div>
                 );
               })}
             </div>
-            {products.length === 0 && <div className="text-center p-8 text-gray-400">Sin productos.</div>}
           </div>
         );
 
@@ -354,29 +429,48 @@ export default function CucharelliApp() {
                 {products.map(p => (
                   <div key={p.id} className="flex items-center justify-between bg-white p-3 rounded-xl shadow-sm border border-[#EFEBE9]">
                     <span className={`font-bold ${BRAND.brownText} truncate text-sm w-1/2`}>{p.name}</span>
-                    <input type="number" placeholder="0" className="w-12 bg-[#F9F7F2] rounded p-1 text-center font-bold text-[#E91E63] outline-none"
-                        value={stockInputs[p.id] || ''} onChange={(e) => setStockInputs({...stockInputs, [p.id]: e.target.value})} />
+                    <input type="number" placeholder="0" className="w-12 bg-[#F9F7F2] rounded p-1 text-center font-bold text-[#E91E63] outline-none" value={stockInputs[p.id] || ''} onChange={(e) => setStockInputs({...stockInputs, [p.id]: e.target.value})} />
                   </div>
                 ))}
               </div>
               <button onClick={updateStockBulk} className={`mt-4 ${BRAND.brown} text-white w-full py-3 rounded-xl font-bold shadow-lg flex justify-center gap-2`}><Save size={20} /> GUARDAR</button>
             </div>
 
+            {/* SECCIÓN TRANSFERENCIA CON RETORNO */}
             <div className="bg-[#E3F2FD] p-5 rounded-2xl border border-blue-100">
-              <h2 className={`text-lg font-bold text-blue-800 mb-2 flex items-center gap-2`}><Home size={18} /> Enviar a Daniela</h2>
+              <div className="flex justify-between items-center mb-4">
+                <h2 className={`text-lg font-bold text-blue-800 flex items-center gap-2`}><ArrowRightLeft size={18} /> Transferencias</h2>
+                
+                {/* BOTÓN DE CAMBIO DE DIRECCIÓN */}
+                <button onClick={() => setTransferDirection(prev => prev === 'to_daniela' ? 'from_daniela' : 'to_daniela')} className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg shadow-sm text-xs font-bold border border-blue-200">
+                  {transferDirection === 'to_daniela' ? (
+                    <>Vitrina <ArrowRight size={14} className="text-blue-500"/> Daniela</>
+                  ) : (
+                    <>Vitrina <ArrowLeft size={14} className="text-orange-500"/> Daniela</>
+                  )}
+                </button>
+              </div>
+              
+              <p className="text-xs text-blue-600 mb-2">
+                {transferDirection === 'to_daniela' ? 'Enviando mercadería A Daniela.' : 'Regresando mercadería DE Daniela.'}
+              </p>
+
               <div className="space-y-2">
                 {products.map(p => (
                   <div key={p.id} className="flex items-center justify-between bg-white/50 p-2 rounded-lg border border-blue-100">
                      <span className="text-xs text-blue-900 font-medium truncate w-1/2">{p.name}</span>
                      <div className="flex items-center gap-2">
-                       <span className="text-[10px] text-gray-400">Disp: {p.stock}</span>
-                       <input type="number" placeholder="0" className="w-12 bg-white rounded p-1 text-center font-bold text-blue-600 outline-none"
-                          value={transferInputs[p.id] || ''} onChange={(e) => setTransferInputs({...transferInputs, [p.id]: e.target.value})} />
+                       <span className="text-[10px] text-gray-400">
+                         {transferDirection === 'to_daniela' ? `Disp: ${p.stock}` : `En Dani: ${p.stockDaniela}`}
+                       </span>
+                       <input type="number" placeholder="0" className="w-12 bg-white rounded p-1 text-center font-bold text-blue-600 outline-none" value={transferInputs[p.id] || ''} onChange={(e) => setTransferInputs({...transferInputs, [p.id]: e.target.value})} />
                      </div>
                   </div>
                 ))}
               </div>
-              <button onClick={transferToDaniela} className={`mt-4 bg-blue-600 text-white w-full py-3 rounded-xl font-bold shadow-lg flex justify-center gap-2`}><ArrowRightLeft size={18} /> ENVIAR</button>
+              <button onClick={handleTransfer} className={`mt-4 ${transferDirection === 'to_daniela' ? 'bg-blue-600' : 'bg-orange-500'} text-white w-full py-3 rounded-xl font-bold shadow-lg flex justify-center gap-2`}>
+                {transferDirection === 'to_daniela' ? 'ENVIAR A DANI' : 'REGRESAR A VITRINA'}
+              </button>
             </div>
           </div>
         );
@@ -384,35 +478,27 @@ export default function CucharelliApp() {
       case 'sales':
         return (
           <div className="p-4 pb-24 max-w-lg mx-auto">
-            {/* 1. SELECCIÓN DE LUGAR DE VENTA */}
+            {activeEvent && (
+              <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-2 mb-4 text-xs font-bold flex justify-between items-center">
+                <span>🔥 Modo: {activeEvent}</span>
+                <span className="text-[10px] font-normal">(Todas las ventas se guardarán aquí)</span>
+              </div>
+            )}
             <div className="bg-gray-100 p-1 rounded-xl flex text-sm font-bold mb-4">
-              <button onClick={() => setSaleLocation('main')} className={`flex-1 py-2 rounded-lg flex items-center justify-center gap-2 transition-all ${saleLocation === 'main' ? 'bg-white shadow text-[#5D4037]' : 'text-gray-400'}`}>
-                <Package size={16}/> Mi Vitrina
-              </button>
-              <button onClick={() => setSaleLocation('daniela')} className={`flex-1 py-2 rounded-lg flex items-center justify-center gap-2 transition-all ${saleLocation === 'daniela' ? 'bg-white shadow text-[#E91E63]' : 'text-gray-400'}`}>
-                <Home size={16}/> Casa Daniela
-              </button>
+              <button onClick={() => setSaleLocation('main')} className={`flex-1 py-2 rounded-lg flex items-center justify-center gap-2 transition-all ${saleLocation === 'main' ? 'bg-white shadow text-[#5D4037]' : 'text-gray-400'}`}><Package size={16}/> Mi Vitrina</button>
+              <button onClick={() => setSaleLocation('daniela')} className={`flex-1 py-2 rounded-lg flex items-center justify-center gap-2 transition-all ${saleLocation === 'daniela' ? 'bg-white shadow text-[#E91E63]' : 'text-gray-400'}`}><Home size={16}/> Casa Daniela</button>
             </div>
-
             <h2 className={`text-xl font-bold ${BRAND.brownText} mb-2 flex items-center gap-2`}><ShoppingCart className="text-[#E91E63]" /> Nueva Venta</h2>
-            
             <div className="space-y-3 mb-6">
               <div className="flex gap-2 text-xs font-bold text-[#8D6E63] px-1"><div className="flex-1">Producto</div><div className="w-16 text-center">Cant.</div><div className="w-20 text-right">Total (S/)</div></div>
               {saleRows.map((row) => (
                 <div key={row.id} className="bg-white p-2 rounded-xl shadow-sm border border-[#EFEBE9] flex gap-2 items-center animate-in fade-in slide-in-from-bottom-2">
                   <div className="flex-1">
-                     <select className={`w-full p-2 bg-[#F9F7F2] border border-[#E0E0E0] rounded-lg text-sm ${BRAND.brownText} outline-none`}
-                      value={row.prodId} onChange={(e) => updateSaleRow(row.id, 'prodId', e.target.value)}>
+                     <select className={`w-full p-2 bg-[#F9F7F2] border border-[#E0E0E0] rounded-lg text-sm ${BRAND.brownText} outline-none`} value={row.prodId} onChange={(e) => updateSaleRow(row.id, 'prodId', e.target.value)}>
                       <option value="">Sabor...</option>
-                      {products.filter(p => (saleLocation === 'main' ? p.stock : p.stockDaniela) > 0).map(p => (
-                        <option key={p.id} value={p.id}>{p.name}</option>
-                      ))}
+                      {products.filter(p => (saleLocation === 'main' ? p.stock : p.stockDaniela) > 0).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                     </select>
-                    {row.prodId && (
-                      <div className="text-[9px] text-gray-400 ml-1 mt-0.5">
-                        Stock {saleLocation === 'main' ? 'Vitrina' : 'Dani'}: {saleLocation === 'main' ? products.find(p => p.id === row.prodId)?.stock : products.find(p => p.id === row.prodId)?.stockDaniela}
-                      </div>
-                    )}
+                    {row.prodId && <div className="text-[9px] text-gray-400 ml-1 mt-0.5">Stock {saleLocation === 'main' ? 'Vitrina' : 'Dani'}: {saleLocation === 'main' ? products.find(p => p.id === row.prodId)?.stock : products.find(p => p.id === row.prodId)?.stockDaniela}</div>}
                   </div>
                   <div className="w-16"><input type="number" min="1" className={`w-full p-2 bg-[#F9F7F2] border border-[#E0E0E0] rounded-lg text-center font-bold ${BRAND.brownText}`} value={row.qty} onChange={(e) => updateSaleRow(row.id, 'qty', e.target.value)}/></div>
                   <div className="w-20"><input type="number" placeholder="0.00" className={`w-full p-2 bg-[#F9F7F2] border border-[#E0E0E0] rounded-lg text-right font-bold ${BRAND.brownText}`} value={row.price} onChange={(e) => updateSaleRow(row.id, 'price', e.target.value)}/></div>
@@ -421,26 +507,11 @@ export default function CucharelliApp() {
               ))}
               <button onClick={addSaleRow} className="w-full py-2 border-2 border-dashed border-[#D7CCC8] rounded-xl text-[#8D6E63] font-bold text-xs flex justify-center items-center gap-2 hover:bg-[#EFEBE9]"><Plus size={16} /> Agregar producto</button>
             </div>
-
-            {/* 2. CAMPO DE NOTA/DESCRIPCIÓN */}
             <div className="mb-20">
-              <label className="text-xs font-bold text-[#8D6E63] mb-1 block">Nota / Cliente (Opcional):</label>
-              <div className="flex items-center gap-2 bg-white border border-[#E0E0E0] rounded-xl p-2">
-                <StickyNote className="text-gray-400" size={18} />
-                <input 
-                  type="text" 
-                  placeholder='Ej: "Mamá de Dani", "Fiado", "Promo"'
-                  className="w-full bg-transparent text-sm outline-none text-[#5D4037]"
-                  value={saleNote}
-                  onChange={(e) => setSaleNote(e.target.value)}
-                />
-              </div>
+              <label className="text-xs font-bold text-[#8D6E63] mb-1 block">Nota / Cliente:</label>
+              <div className="flex items-center gap-2 bg-white border border-[#E0E0E0] rounded-xl p-2"><StickyNote className="text-gray-400" size={18} /><input type="text" placeholder='Ej: "Mamá de Dani", "Fiado", "Promo"' className="w-full bg-transparent text-sm outline-none text-[#5D4037]" value={saleNote} onChange={(e) => setSaleNote(e.target.value)} /></div>
             </div>
-
-            <div className="fixed bottom-20 left-0 right-0 p-4 bg-white border-t border-gray-100 shadow-[0_-5px_20px_rgba(0,0,0,0.05)]">
-              <div className="flex justify-between items-center mb-3"><span className="text-[#8D6E63] font-medium">Total a cobrar:</span><span className={`text-2xl font-bold ${BRAND.brownText}`}>S/ {totalSaleAmount.toFixed(2)}</span></div>
-              <button onClick={registerMultiSale} className="w-full bg-[#4CAF50] text-white py-3 rounded-xl font-bold shadow-lg hover:bg-[#43A047]">CONFIRMAR VENTA</button>
-            </div>
+            <div className="fixed bottom-20 left-0 right-0 p-4 bg-white border-t border-gray-100 shadow-[0_-5px_20px_rgba(0,0,0,0.05)]"><div className="flex justify-between items-center mb-3"><span className="text-[#8D6E63] font-medium">Total a cobrar:</span><span className={`text-2xl font-bold ${BRAND.brownText}`}>S/ {totalSaleAmount.toFixed(2)}</span></div><button onClick={registerMultiSale} className="w-full bg-[#4CAF50] text-white py-3 rounded-xl font-bold shadow-lg hover:bg-[#43A047]">CONFIRMAR VENTA</button></div>
           </div>
         );
 
@@ -467,20 +538,26 @@ export default function CucharelliApp() {
         const totalExpenses = filteredTransactions.filter(t => t.type === 'expense').reduce((acc, t) => acc + (t.amount || 0), 0);
         return (
           <div className="p-4 pb-20">
-            <div className="flex justify-between items-center mb-6">
+            <div className="flex flex-col gap-2 mb-6">
               <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}><Activity className="text-[#E91E63]" /> Reporte</h2>
-              <div className="flex gap-2">
-                <button onClick={exportToCSV} className="bg-green-100 text-green-700 p-2 rounded-lg text-xs font-bold flex items-center gap-1"><FileDown size={16}/> CSV</button>
-                <select value={reportFilter} onChange={(e) => setReportFilter(e.target.value)} className="bg-gray-100 text-xs p-2 rounded-lg outline-none font-bold">
+              <div className="flex gap-2 w-full">
+                <select value={reportFilter} onChange={(e) => setReportFilter(e.target.value)} className="bg-gray-100 text-xs p-2 rounded-lg outline-none font-bold flex-1">
                   <option value="month">Este Mes</option>
-                  <option value="all">Todo</option>
+                  <option value="all">Histórico Completo</option>
+                  {uniqueEvents.length > 0 && <optgroup label="Eventos / Ferias">
+                    {uniqueEvents.map(ev => <option key={ev} value={ev}>{ev}</option>)}
+                  </optgroup>}
                 </select>
+                <button onClick={exportToCSV} className="bg-green-100 text-green-700 p-2 rounded-lg text-xs font-bold flex items-center gap-1"><FileDown size={16}/> CSV</button>
               </div>
             </div>
 
             <div className={`${BRAND.brown} text-white p-6 rounded-2xl shadow-lg mb-6 relative overflow-hidden`}>
                <div className="absolute top-0 right-0 -mt-4 -mr-4 w-24 h-24 bg-[#E91E63] rounded-full opacity-20 blur-xl"></div>
-               <p className="text-orange-100 text-sm mb-1">Ganancia Neta ({reportFilter === 'month' ? 'Mes' : 'Total'})</p>
+               <p className="text-orange-100 text-sm mb-1">
+                 Ganancia Neta 
+                 {uniqueEvents.includes(reportFilter) ? ` (${reportFilter})` : (reportFilter === 'month' ? ' (Este Mes)' : ' (Total)')}
+               </p>
                <h3 className="text-4xl font-bold">S/ {(totalSales - totalExpenses).toFixed(2)}</h3>
                <div className="flex gap-4 mt-4 pt-4 border-t border-white/10">
                  <div><p className="text-[10px] text-green-300 uppercase">Ingresos</p><p className="font-bold">S/ {totalSales.toFixed(2)}</p></div>
@@ -504,9 +581,12 @@ export default function CucharelliApp() {
                       <div className="flex justify-between items-start mb-2">
                         <div className="flex items-center gap-2">
                           <div className={`w-2 h-2 rounded-full ${t.type === 'sale' ? 'bg-green-500' : t.type === 'expense' ? 'bg-red-500' : t.type === 'transfer' ? 'bg-blue-500' : 'bg-gray-500'}`}></div>
-                          <span className={`font-bold ${BRAND.brownText} text-sm`}>
-                            {t.type === 'sale' ? (t.location === 'daniela' ? 'Venta (Dani)' : 'Venta (Vitrina)') : t.type === 'expense' ? 'Gasto' : t.type === 'transfer' ? 'Traslado' : 'Producción'}
-                          </span>
+                          <div className="flex flex-col">
+                            <span className={`font-bold ${BRAND.brownText} text-sm`}>
+                              {t.type === 'sale' ? (t.location === 'daniela' ? 'Venta (Dani)' : 'Venta (Vitrina)') : t.type === 'expense' ? 'Gasto' : t.type === 'transfer' ? 'Traslado' : 'Producción'}
+                            </span>
+                            {t.eventName && <span className="text-[9px] bg-yellow-100 text-yellow-800 px-1 rounded w-fit">{t.eventName}</span>}
+                          </div>
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-gray-400">{t.createdAt.toLocaleDateString()}</span>
@@ -529,6 +609,29 @@ export default function CucharelliApp() {
         return (
           <div className="p-4 space-y-6 pb-20">
             <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}><Settings className="text-gray-400" /> Ajustes</h2>
+            
+            {/* GESTION DE EVENTOS (FERIAS) */}
+            <div className="bg-yellow-50 p-5 rounded-2xl border border-yellow-200">
+              <h3 className="font-bold text-yellow-800 mb-2 flex items-center gap-2"><MapPin size={18}/> Modo Evento / Feria</h3>
+              <p className="text-xs text-yellow-700 mb-3">Actívalo para separar las cuentas de una feria específica.</p>
+              
+              {activeEvent ? (
+                <div className="flex justify-between items-center bg-white p-3 rounded-xl border border-yellow-300">
+                  <div>
+                    <p className="text-xs text-gray-500">Evento Activo:</p>
+                    <p className="font-bold text-lg text-yellow-700">{activeEvent}</p>
+                  </div>
+                  <button onClick={deactivateEvent} className="bg-gray-200 text-gray-600 px-3 py-2 rounded-lg text-xs font-bold">Desactivar</button>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <input className="flex-1 p-2 rounded-lg border text-sm" placeholder="Nombre (Ej: Feria Julio)" value={tempEventName} onChange={(e) => setTempEventName(e.target.value)} />
+                  <button onClick={activateEvent} className="bg-yellow-500 text-white px-4 py-2 rounded-lg font-bold text-sm">Activar</button>
+                </div>
+              )}
+            </div>
+
+            {/* FORMULARIO PRODUCTOS */}
             <div className={`p-5 rounded-2xl shadow-sm border transition-colors ${editingId ? 'bg-orange-50 border-orange-200' : 'bg-white border-[#EFEBE9]'}`}>
               <h3 className={`font-bold ${editingId ? 'text-orange-700' : BRAND.brownText} mb-4 flex items-center gap-2 justify-between`}>
                 <span className="flex items-center gap-2"><ImageIcon size={18} className={editingId ? 'text-orange-500' : 'text-[#E91E63]'}/> {editingId ? 'Editando' : 'Nuevo Sabor'}</span>
@@ -541,6 +644,8 @@ export default function CucharelliApp() {
                 <button onClick={handleSaveProduct} className={`${editingId ? 'bg-orange-600 hover:bg-orange-700' : BRAND.brown} text-white w-full py-3 rounded-xl font-bold text-sm shadow transition`}>{editingId ? 'Actualizar' : 'Guardar'}</button>
               </div>
             </div>
+
+            {/* LISTA PRODUCTOS */}
             <div className="bg-white p-5 rounded-2xl shadow-sm border border-[#EFEBE9]">
               <h3 className={`font-bold ${BRAND.brownText} mb-4 flex items-center gap-2`}>Gestionar Sabores</h3>
               <div className="space-y-3">
@@ -552,6 +657,16 @@ export default function CucharelliApp() {
                 ))}
               </div>
             </div>
+
+            {/* ZONA DE PELIGRO (BORRADO TOTAL) */}
+            <div className="bg-red-50 p-5 rounded-2xl border border-red-200 mt-8">
+              <h3 className="font-bold text-red-800 mb-2 flex items-center gap-2"><AlertTriangle size={18}/> Zona de Peligro</h3>
+              <p className="text-xs text-red-700 mb-3">Si necesitas empezar de cero, usa este botón. Cuidado: No hay vuelta atrás.</p>
+              <button onClick={clearAllHistory} className="w-full bg-red-600 text-white py-3 rounded-xl font-bold shadow-lg hover:bg-red-700 active:scale-95 transition-all text-sm flex justify-center gap-2">
+                <Trash2 size={16}/> BORRAR TODO EL HISTORIAL
+              </button>
+            </div>
+
             <div className="bg-[#E3F2FD] p-5 rounded-2xl border border-blue-100 text-center"><p className="text-sm text-gray-500 mb-2">Base de datos configurada internamente.</p>{!isFirebaseReady ? <span className="text-orange-500 font-bold text-xs">Conectando...</span> : <span className="inline-flex items-center gap-1 text-green-700 bg-green-100 px-3 py-1 rounded-full text-xs font-bold">● Conectado a Cucharelli</span>}</div>
           </div>
         );
