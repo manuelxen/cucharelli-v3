@@ -10,7 +10,7 @@ import {
   Settings, PlusCircle, Trash2, Save, Activity, LayoutGrid,
   Image as ImageIcon, Plus, X, Pencil, RotateCcw,
   ArrowRightLeft, FileDown, Calendar, Home, StickyNote,
-  MapPin, AlertTriangle, ArrowRight, ArrowLeft
+  MapPin, AlertTriangle, ArrowRight, ArrowLeft, Tag
 } from 'lucide-react';
 
 // --- CONFIGURACIÓN DE FIREBASE ---
@@ -47,6 +47,7 @@ export default function CucharelliApp() {
   const [activeTab, setActiveTab] = useState('stock');
   const [products, setProducts] = useState(initialProducts);
   const [transactions, setTransactions] = useState([]);
+  const [eventsList, setEventsList] = useState([]); // Lista de eventos activos gestionados en base de datos
   
   // Firebase
   const [isFirebaseReady, setIsFirebaseReady] = useState(false);
@@ -58,12 +59,11 @@ export default function CucharelliApp() {
   // Estados de Interfaz
   const [companyName, setCompanyName] = useState('Cucharelli');
   const [stockViewMode, setStockViewMode] = useState('main'); 
-  const [reportFilter, setReportFilter] = useState('month'); // 'all', 'month', o ID de evento
-  const [transferDirection, setTransferDirection] = useState('to_daniela'); // 'to_daniela' o 'from_daniela'
+  const [reportFilter, setReportFilter] = useState('month'); 
+  const [transferDirection, setTransferDirection] = useState('to_daniela');
 
-  // Estados de Eventos (Feria)
-  const [activeEvent, setActiveEvent] = useState(''); // Nombre del evento activo (ej: 'Feria Barranco')
-  const [tempEventName, setTempEventName] = useState(''); // Input para crear evento
+  // Estados de Eventos (Gestión)
+  const [tempEventName, setTempEventName] = useState('');
 
   // Formularios
   const [newProdName, setNewProdName] = useState('');
@@ -76,7 +76,9 @@ export default function CucharelliApp() {
   const [saleRows, setSaleRows] = useState([{ id: Date.now(), prodId: '', qty: 1, price: '' }]);
   const [saleLocation, setSaleLocation] = useState('main'); 
   const [saleNote, setSaleNote] = useState(''); 
+  const [selectedEventId, setSelectedEventId] = useState(''); // Evento seleccionado para la venta actual
   const [expenseRows, setExpenseRows] = useState([{ id: Date.now(), desc: '', amount: '' }]);
+  const [expenseEventId, setExpenseEventId] = useState(''); // Evento seleccionado para el gasto actual
 
   // Edición de Reportes
   const [editingTransId, setEditingTransId] = useState(null);
@@ -87,11 +89,6 @@ export default function CucharelliApp() {
   useEffect(() => {
     const savedName = localStorage.getItem('cucharelli_company_name');
     if (savedName) setCompanyName(savedName);
-    
-    // Cargar evento activo si existe
-    const savedEvent = localStorage.getItem('cucharelli_active_event');
-    if (savedEvent) setActiveEvent(savedEvent);
-
     initFirebase(firebaseConfig);
   }, []);
 
@@ -110,6 +107,8 @@ export default function CucharelliApp() {
 
   useEffect(() => {
     if (!isFirebaseReady || !db || !user) return;
+    
+    // Escuchar Productos
     const qProd = query(collection(db, 'artifacts', appId, 'public', 'data', 'products'), orderBy('name'));
     const unsubProd = onSnapshot(qProd, (snapshot) => {
       setProducts(snapshot.docs.map(doc => ({ 
@@ -118,11 +117,20 @@ export default function CucharelliApp() {
         stockDaniela: doc.data().stockDaniela || 0
       })));
     });
+
+    // Escuchar Transacciones
     const qTrans = query(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'), orderBy('createdAt', 'desc'));
     const unsubTrans = onSnapshot(qTrans, (snapshot) => {
       setTransactions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), createdAt: doc.data().createdAt?.toDate() || new Date() })));
     });
-    return () => { unsubProd(); unsubTrans(); };
+
+    // Escuchar Lista de Eventos Activos (Nueva Colección)
+    const qEvents = query(collection(db, 'artifacts', appId, 'public', 'data', 'events'), orderBy('createdAt', 'desc'));
+    const unsubEvents = onSnapshot(qEvents, (snapshot) => {
+      setEventsList(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    });
+
+    return () => { unsubProd(); unsubTrans(); unsubEvents(); };
   }, [isFirebaseReady, db, user, appId]);
 
   // --- GESTIÓN PRODUCTOS ---
@@ -157,6 +165,24 @@ export default function CucharelliApp() {
     if (isFirebaseReady && db) await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id));
   };
 
+  // --- GESTIÓN DE EVENTOS (NUEVO V6) ---
+  const createEvent = async () => {
+    if (!tempEventName) return alert("Escribe un nombre para el evento");
+    if (isFirebaseReady && db) {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'events'), {
+        name: tempEventName,
+        createdAt: serverTimestamp()
+      });
+      setTempEventName('');
+      alert("Evento creado. Ahora aparecerá en Ventas y Gastos.");
+    }
+  };
+
+  const deleteEvent = async (id) => {
+    if (!window.confirm("¿Eliminar este evento de la lista? (No borrará las ventas pasadas)")) return;
+    if (isFirebaseReady && db) await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'events', id));
+  };
+
   // --- MOVIMIENTOS STOCK ---
   const updateStockBulk = async () => {
     const updates = Object.entries(stockInputs).filter(([_, qty]) => parseInt(qty) > 0);
@@ -167,20 +193,17 @@ export default function CucharelliApp() {
         batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), { stock: increment(parseInt(qty)) });
       });
       batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions')), {
-        type: 'restock', location: 'main', items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), createdAt: serverTimestamp(),
-        eventName: activeEvent || null
+        type: 'restock', location: 'main', items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), createdAt: serverTimestamp()
       });
       await batch.commit();
     }
     setStockInputs({}); alert("Producción registrada");
   };
 
-  // NUEVO: TRANSFERENCIA BIDIRECCIONAL
   const handleTransfer = async () => {
     const updates = Object.entries(transferInputs).filter(([_, qty]) => parseInt(qty) > 0);
     if (updates.length === 0) return;
 
-    // Validar Stock según dirección
     for (let [id, qty] of updates) {
       const prod = products.find(p => p.id === id);
       if (transferDirection === 'to_daniela' && prod.stock < parseInt(qty)) return alert(`Falta stock de ${prod.name} en Vitrina.`);
@@ -192,23 +215,15 @@ export default function CucharelliApp() {
       updates.forEach(([id, qty]) => {
         const ref = doc(db, 'artifacts', appId, 'public', 'data', 'products', id);
         if (transferDirection === 'to_daniela') {
-          // Vitrina -> Daniela
           batch.update(ref, { stock: increment(-parseInt(qty)), stockDaniela: increment(parseInt(qty)) });
         } else {
-          // Daniela -> Vitrina (Regreso)
           batch.update(ref, { stock: increment(parseInt(qty)), stockDaniela: increment(-parseInt(qty)) });
         }
       });
       
       const desc = transferDirection === 'to_daniela' ? 'Envío a Daniela' : 'Retorno de Daniela';
-      
       batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions')), {
-        type: 'transfer', 
-        description: desc, 
-        amount: 0, 
-        items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), 
-        createdAt: serverTimestamp(),
-        eventName: activeEvent || null
+        type: 'transfer', description: desc, amount: 0, items: updates.map(([id, qty]) => ({ name: products.find(x => x.id === id)?.name, qty: parseInt(qty) })), createdAt: serverTimestamp()
       });
       await batch.commit();
     }
@@ -244,6 +259,9 @@ export default function CucharelliApp() {
         }
       });
       
+      // Obtener nombre del evento si hay uno seleccionado
+      const eventName = selectedEventId ? eventsList.find(e => e.id === selectedEventId)?.name : null;
+
       batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions')), {
         type: 'sale', 
         location: saleLocation, 
@@ -255,7 +273,7 @@ export default function CucharelliApp() {
           lineTotal: parseFloat(row.price)
         })),
         createdAt: serverTimestamp(),
-        eventName: activeEvent || null // GUARDAMOS EL EVENTO ACTIVO
+        eventName: eventName // Ahora es por venta, no global
       });
       await batch.commit();
     }
@@ -270,30 +288,19 @@ export default function CucharelliApp() {
     const validRows = expenseRows.filter(r => r.desc && r.amount);
     if (validRows.length === 0) return alert("Datos incompletos");
     const total = validRows.reduce((acc, r) => acc + parseFloat(r.amount), 0);
+    
+    const eventName = expenseEventId ? eventsList.find(e => e.id === expenseEventId)?.name : null;
+
     if (isFirebaseReady && db) await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'), {
       type: 'expense', amount: total, 
       items: validRows.map(r => ({ desc: r.desc, price: parseFloat(r.amount) })), 
       createdAt: serverTimestamp(),
-      eventName: activeEvent || null // GUARDAMOS EL EVENTO
+      eventName: eventName
     });
     setExpenseRows([{ id: Date.now(), desc: '', amount: '' }]); alert("Gastos registrados");
   };
 
-  // --- GESTIÓN DE EVENTOS Y REPORTES ---
-  const activateEvent = () => {
-    if(!tempEventName) return alert("Escribe un nombre para el evento (ej: Feria Julio)");
-    setActiveEvent(tempEventName);
-    localStorage.setItem('cucharelli_active_event', tempEventName);
-    setTempEventName('');
-    alert(`Modo Evento activado: ${tempEventName}. Ahora las ventas se guardarán con este nombre.`);
-  };
-
-  const deactivateEvent = () => {
-    setActiveEvent('');
-    localStorage.removeItem('cucharelli_active_event');
-    alert("Modo Evento desactivado. Volviendo a ventas normales.");
-  };
-
+  // --- REPORTES ---
   const saveTransactionEdit = async () => {
     if (!editingTransId) return;
     if (isFirebaseReady && db) {
@@ -308,22 +315,15 @@ export default function CucharelliApp() {
     if (window.confirm("¿Borrar?")) if (isFirebaseReady && db) await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'transactions', id));
   };
 
-  // NUEVO: BORRADO TOTAL
   const clearAllHistory = async () => {
-    const confirm1 = window.confirm("⚠️ ¿ESTÁS SEGURO?\n\nEsto borrará TODO el historial de ventas y gastos de los reportes. Tu stock y productos NO se borrarán.");
-    if (!confirm1) return;
-    const confirm2 = window.confirm("⚠️ CONFIRMACIÓN FINAL\n\n¿Realmente quieres dejar los reportes en CERO? No se puede deshacer.");
-    if (!confirm2) return;
-
+    if (!window.confirm("⚠️ ¿BORRAR TODO EL HISTORIAL DE VENTAS Y GASTOS?")) return;
     if (isFirebaseReady && db) {
       const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'));
       const snapshot = await getDocs(q);
       const batch = writeBatch(db);
-      snapshot.docs.forEach((doc) => {
-        batch.delete(doc.ref);
-      });
+      snapshot.docs.forEach((doc) => batch.delete(doc.ref));
       await batch.commit();
-      alert("Historial borrado exitosamente. Inicio limpio.");
+      alert("Historial borrado.");
     }
   };
 
@@ -334,8 +334,8 @@ export default function CucharelliApp() {
     link.download = `reporte_${reportFilter}.csv`; document.body.appendChild(link); link.click();
   };
 
-  // Obtener lista de eventos únicos para el filtro
-  const uniqueEvents = useMemo(() => {
+  // Obtener lista de eventos históricos para el filtro (mezcla de actuales y pasados)
+  const allHistoricalEvents = useMemo(() => {
     const events = new Set();
     transactions.forEach(t => { if(t.eventName) events.add(t.eventName); });
     return Array.from(events);
@@ -343,26 +343,13 @@ export default function CucharelliApp() {
 
   const filteredTransactions = useMemo(() => {
     if (reportFilter === 'all') return transactions;
-    
-    // Si el filtro coincide con un nombre de evento, filtramos por evento
-    if (uniqueEvents.includes(reportFilter)) {
-      return transactions.filter(t => t.eventName === reportFilter);
-    }
-
-    // Filtros de fecha normales
+    if (allHistoricalEvents.includes(reportFilter)) return transactions.filter(t => t.eventName === reportFilter);
     const now = new Date();
-    return transactions.filter(t => {
-      // Si filtramos por mes/hoy, excluimos los de ferias si se quiere (opcional), 
-      // pero normalmente "Mes" incluye todo. Aqui filtramos por fecha.
-      return t.createdAt.getMonth() === now.getMonth() && t.createdAt.getFullYear() === now.getFullYear();
-    });
-  }, [transactions, reportFilter, uniqueEvents]);
+    return transactions.filter(t => t.createdAt.getMonth() === now.getMonth() && t.createdAt.getFullYear() === now.getFullYear());
+  }, [transactions, reportFilter, allHistoricalEvents]);
 
-  // Totales
   const totalSales = filteredTransactions.filter(t => t.type === 'sale').reduce((acc, t) => acc + (t.amount || 0), 0);
   const totalExpenses = filteredTransactions.filter(t => t.type === 'expense').reduce((acc, t) => acc + (t.amount || 0), 0);
-
-  // Totales de Stock
   const totalStockMain = products.reduce((acc, p) => acc + (p.stock || 0), 0);
   const totalStockDaniela = products.reduce((acc, p) => acc + (p.stockDaniela || 0), 0);
 
@@ -375,7 +362,6 @@ export default function CucharelliApp() {
       </div>
       <div className="flex flex-col items-end">
         <span className={`${BRAND.pinkBg} text-white text-xs font-bold px-3 py-1 rounded-full shadow-sm`}>{title}</span>
-        {activeEvent && <span className="text-[9px] bg-yellow-400 text-brown-900 px-2 py-0.5 rounded mt-1 font-bold animate-pulse">Mode: {activeEvent}</span>}
       </div>
     </div>
   );
@@ -436,33 +422,19 @@ export default function CucharelliApp() {
               <button onClick={updateStockBulk} className={`mt-4 ${BRAND.brown} text-white w-full py-3 rounded-xl font-bold shadow-lg flex justify-center gap-2`}><Save size={20} /> GUARDAR</button>
             </div>
 
-            {/* SECCIÓN TRANSFERENCIA CON RETORNO */}
             <div className="bg-[#E3F2FD] p-5 rounded-2xl border border-blue-100">
               <div className="flex justify-between items-center mb-4">
                 <h2 className={`text-lg font-bold text-blue-800 flex items-center gap-2`}><ArrowRightLeft size={18} /> Transferencias</h2>
-                
-                {/* BOTÓN DE CAMBIO DE DIRECCIÓN */}
                 <button onClick={() => setTransferDirection(prev => prev === 'to_daniela' ? 'from_daniela' : 'to_daniela')} className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg shadow-sm text-xs font-bold border border-blue-200">
-                  {transferDirection === 'to_daniela' ? (
-                    <>Vitrina <ArrowRight size={14} className="text-blue-500"/> Daniela</>
-                  ) : (
-                    <>Vitrina <ArrowLeft size={14} className="text-orange-500"/> Daniela</>
-                  )}
+                  {transferDirection === 'to_daniela' ? <><ArrowRight size={14} className="text-blue-500"/> A Daniela</> : <><ArrowLeft size={14} className="text-orange-500"/> Regresar</>}
                 </button>
               </div>
-              
-              <p className="text-xs text-blue-600 mb-2">
-                {transferDirection === 'to_daniela' ? 'Enviando mercadería A Daniela.' : 'Regresando mercadería DE Daniela.'}
-              </p>
-
               <div className="space-y-2">
                 {products.map(p => (
                   <div key={p.id} className="flex items-center justify-between bg-white/50 p-2 rounded-lg border border-blue-100">
                      <span className="text-xs text-blue-900 font-medium truncate w-1/2">{p.name}</span>
                      <div className="flex items-center gap-2">
-                       <span className="text-[10px] text-gray-400">
-                         {transferDirection === 'to_daniela' ? `Disp: ${p.stock}` : `En Dani: ${p.stockDaniela}`}
-                       </span>
+                       <span className="text-[10px] text-gray-400">{transferDirection === 'to_daniela' ? `Disp: ${p.stock}` : `En Dani: ${p.stockDaniela}`}</span>
                        <input type="number" placeholder="0" className="w-12 bg-white rounded p-1 text-center font-bold text-blue-600 outline-none" value={transferInputs[p.id] || ''} onChange={(e) => setTransferInputs({...transferInputs, [p.id]: e.target.value})} />
                      </div>
                   </div>
@@ -478,17 +450,29 @@ export default function CucharelliApp() {
       case 'sales':
         return (
           <div className="p-4 pb-24 max-w-lg mx-auto">
-            {activeEvent && (
-              <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-2 mb-4 text-xs font-bold flex justify-between items-center">
-                <span>🔥 Modo: {activeEvent}</span>
-                <span className="text-[10px] font-normal">(Todas las ventas se guardarán aquí)</span>
-              </div>
-            )}
+            {/* 1. SELECCIÓN DE LUGAR */}
             <div className="bg-gray-100 p-1 rounded-xl flex text-sm font-bold mb-4">
               <button onClick={() => setSaleLocation('main')} className={`flex-1 py-2 rounded-lg flex items-center justify-center gap-2 transition-all ${saleLocation === 'main' ? 'bg-white shadow text-[#5D4037]' : 'text-gray-400'}`}><Package size={16}/> Mi Vitrina</button>
               <button onClick={() => setSaleLocation('daniela')} className={`flex-1 py-2 rounded-lg flex items-center justify-center gap-2 transition-all ${saleLocation === 'daniela' ? 'bg-white shadow text-[#E91E63]' : 'text-gray-400'}`}><Home size={16}/> Casa Daniela</button>
             </div>
-            <h2 className={`text-xl font-bold ${BRAND.brownText} mb-2 flex items-center gap-2`}><ShoppingCart className="text-[#E91E63]" /> Nueva Venta</h2>
+
+            <div className="flex justify-between items-center mb-2">
+              <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}><ShoppingCart className="text-[#E91E63]" /> Nueva Venta</h2>
+              
+              {/* 2. SELECTOR DE EVENTO INDIVIDUAL */}
+              <div className="relative">
+                <select 
+                  value={selectedEventId} 
+                  onChange={(e) => setSelectedEventId(e.target.value)}
+                  className={`text-xs font-bold py-1 pl-2 pr-6 rounded-lg outline-none appearance-none border ${selectedEventId ? 'bg-yellow-100 text-yellow-800 border-yellow-300' : 'bg-white text-gray-500 border-gray-200'}`}
+                >
+                  <option value="">Venta Normal</option>
+                  {eventsList.map(ev => <option key={ev.id} value={ev.id}>{ev.name}</option>)}
+                </select>
+                <Tag size={12} className={`absolute right-2 top-1.5 ${selectedEventId ? 'text-yellow-600' : 'text-gray-400'}`} />
+              </div>
+            </div>
+            
             <div className="space-y-3 mb-6">
               <div className="flex gap-2 text-xs font-bold text-[#8D6E63] px-1"><div className="flex-1">Producto</div><div className="w-16 text-center">Cant.</div><div className="w-20 text-right">Total (S/)</div></div>
               {saleRows.map((row) => (
@@ -518,7 +502,16 @@ export default function CucharelliApp() {
       case 'expenses':
         return (
           <div className="p-4 pb-24">
-             <h2 className={`text-xl font-bold ${BRAND.brownText} mb-2 flex items-center gap-2`}><TrendingUp className="text-red-500" /> Registrar Gastos</h2>
+             <div className="flex justify-between items-center mb-4">
+                <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}><TrendingUp className="text-red-500" /> Gastos</h2>
+                <div className="relative">
+                  <select value={expenseEventId} onChange={(e) => setExpenseEventId(e.target.value)} className={`text-xs font-bold py-1 pl-2 pr-6 rounded-lg outline-none appearance-none border ${expenseEventId ? 'bg-yellow-100 text-yellow-800 border-yellow-300' : 'bg-white text-gray-500 border-gray-200'}`}>
+                    <option value="">Gasto Normal</option>
+                    {eventsList.map(ev => <option key={ev.id} value={ev.id}>{ev.name}</option>)}
+                  </select>
+                  <Tag size={12} className={`absolute right-2 top-1.5 ${expenseEventId ? 'text-yellow-600' : 'text-gray-400'}`} />
+                </div>
+             </div>
             <div className="space-y-3 mb-20">
               {expenseRows.map((row) => (
                 <div key={row.id} className="bg-white p-3 rounded-xl shadow-sm border border-l-4 border-l-red-400 flex gap-2 items-center">
@@ -544,8 +537,8 @@ export default function CucharelliApp() {
                 <select value={reportFilter} onChange={(e) => setReportFilter(e.target.value)} className="bg-gray-100 text-xs p-2 rounded-lg outline-none font-bold flex-1">
                   <option value="month">Este Mes</option>
                   <option value="all">Histórico Completo</option>
-                  {uniqueEvents.length > 0 && <optgroup label="Eventos / Ferias">
-                    {uniqueEvents.map(ev => <option key={ev} value={ev}>{ev}</option>)}
+                  {allHistoricalEvents.length > 0 && <optgroup label="Eventos / Ferias">
+                    {allHistoricalEvents.map(ev => <option key={ev} value={ev}>{ev}</option>)}
                   </optgroup>}
                 </select>
                 <button onClick={exportToCSV} className="bg-green-100 text-green-700 p-2 rounded-lg text-xs font-bold flex items-center gap-1"><FileDown size={16}/> CSV</button>
@@ -556,7 +549,7 @@ export default function CucharelliApp() {
                <div className="absolute top-0 right-0 -mt-4 -mr-4 w-24 h-24 bg-[#E91E63] rounded-full opacity-20 blur-xl"></div>
                <p className="text-orange-100 text-sm mb-1">
                  Ganancia Neta 
-                 {uniqueEvents.includes(reportFilter) ? ` (${reportFilter})` : (reportFilter === 'month' ? ' (Este Mes)' : ' (Total)')}
+                 {allHistoricalEvents.includes(reportFilter) ? ` (${reportFilter})` : (reportFilter === 'month' ? ' (Este Mes)' : ' (Total)')}
                </p>
                <h3 className="text-4xl font-bold">S/ {(totalSales - totalExpenses).toFixed(2)}</h3>
                <div className="flex gap-4 mt-4 pt-4 border-t border-white/10">
@@ -610,25 +603,25 @@ export default function CucharelliApp() {
           <div className="p-4 space-y-6 pb-20">
             <h2 className={`text-xl font-bold ${BRAND.brownText} flex items-center gap-2`}><Settings className="text-gray-400" /> Ajustes</h2>
             
-            {/* GESTION DE EVENTOS (FERIAS) */}
+            {/* GESTION DE EVENTOS (NUEVO V6 - LISTA) */}
             <div className="bg-yellow-50 p-5 rounded-2xl border border-yellow-200">
-              <h3 className="font-bold text-yellow-800 mb-2 flex items-center gap-2"><MapPin size={18}/> Modo Evento / Feria</h3>
-              <p className="text-xs text-yellow-700 mb-3">Actívalo para separar las cuentas de una feria específica.</p>
+              <h3 className="font-bold text-yellow-800 mb-2 flex items-center gap-2"><MapPin size={18}/> Gestión de Eventos Activos</h3>
+              <p className="text-xs text-yellow-700 mb-3">Crea aquí tus ferias para que aparezcan disponibles en la pantalla de ventas.</p>
               
-              {activeEvent ? (
-                <div className="flex justify-between items-center bg-white p-3 rounded-xl border border-yellow-300">
-                  <div>
-                    <p className="text-xs text-gray-500">Evento Activo:</p>
-                    <p className="font-bold text-lg text-yellow-700">{activeEvent}</p>
+              <div className="flex gap-2 mb-3">
+                <input className="flex-1 p-2 rounded-lg border text-sm" placeholder="Nombre (Ej: Feria Barranco)" value={tempEventName} onChange={(e) => setTempEventName(e.target.value)} />
+                <button onClick={createEvent} className="bg-yellow-500 text-white px-4 py-2 rounded-lg font-bold text-sm shadow">Crear</button>
+              </div>
+
+              <div className="space-y-2">
+                {eventsList.length === 0 && <p className="text-xs text-gray-400 text-center italic">No hay eventos activos.</p>}
+                {eventsList.map(ev => (
+                  <div key={ev.id} className="flex justify-between items-center bg-white p-2 rounded-lg border border-yellow-100">
+                    <span className="text-sm font-bold text-yellow-900">{ev.name}</span>
+                    <button onClick={() => deleteEvent(ev.id)} className="text-red-400 hover:text-red-600"><Trash2 size={16}/></button>
                   </div>
-                  <button onClick={deactivateEvent} className="bg-gray-200 text-gray-600 px-3 py-2 rounded-lg text-xs font-bold">Desactivar</button>
-                </div>
-              ) : (
-                <div className="flex gap-2">
-                  <input className="flex-1 p-2 rounded-lg border text-sm" placeholder="Nombre (Ej: Feria Julio)" value={tempEventName} onChange={(e) => setTempEventName(e.target.value)} />
-                  <button onClick={activateEvent} className="bg-yellow-500 text-white px-4 py-2 rounded-lg font-bold text-sm">Activar</button>
-                </div>
-              )}
+                ))}
+              </div>
             </div>
 
             {/* FORMULARIO PRODUCTOS */}
